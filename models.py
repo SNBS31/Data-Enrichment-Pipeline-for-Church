@@ -24,8 +24,8 @@ class Church(Base):
     last_crawled_at = Column(DateTime, nullable=True)
     robots_txt_checked = Column(Boolean, default=False)
     sitemap_found = Column(Boolean, default=False)
-    sitemap_url = Column(String, nullable=False)
-    pages_sampled_count = Column(Boolean, default=0)
+    sitemap_url = Column(String, nullable=True)
+    pages_sampled_count = Column(Integer, default=0)
     
     # Timestamps 
     created_at = Column(DateTime, server_default=func.now())
@@ -38,7 +38,7 @@ class Church(Base):
     key_pages = relationship("KeyPage", back_populates="church", cascade="all, delete-orphan")
     prayer_details = relationship("PrayerDetails", back_populates="church", uselist=False, cascade="all, delete-orphan")
     giving_details = relationship("GivingDetails", back_populates="church", uselist=False, cascade="all, delete-orphan")
-    additional_info = relationship("AdditionalInfo", back_populates="church", uselist=False,  cascade="all, delete-orphan")
+    additional_info = relationship("AdditionalInfo", back_populates="church", cascade="all, delete-orphan")
     raw_html_pages = relationship("RawHTML", back_populates="church", cascade="all, delete-orphan")
     
     def __repr__(self):
@@ -120,7 +120,8 @@ class AdditionalInfo(Base):
     __tablename__ = "additional_info"
 
     id = Column(Integer, primary_key=True, index=True)
-    church_id = Column(Integer, ForeignKey("churches.id"), nullable=False, unique=True)
+    # Many key/value rows per church - no unique constraint
+    church_id = Column(Integer, ForeignKey("churches.id"), nullable=False)
     key = Column(String, nullable=True)
     value = Column(Text, nullable=True)
 

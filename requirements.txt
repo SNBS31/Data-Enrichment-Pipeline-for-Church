@@ -16,3 +16,14 @@ starlette==1.0.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 uvicorn==0.44.0
+# LLM runtime: llama-cpp-python + huggingface_hub instead of torch/transformers.
+# Rationale: torch 2.11.0+cpu segfaults (exit 139) on Windows when loading
+# Qwen2.5-1.5B through transformers.pipeline. llama-cpp-python ships prebuilt
+# wheels, runs the same Qwen2.5-1.5B-Instruct via a GGUF build, and avoids
+# the segfault entirely. Boss requirement met: every fuzzy field is still
+# produced by the Qwen LLM, not by regex.
+llama-cpp-python==0.3.20
+huggingface_hub==1.10.2
+requests
+beautifulsoup4
+lxml
