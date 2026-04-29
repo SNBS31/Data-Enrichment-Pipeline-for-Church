@@ -1,22 +1,19 @@
 """
-Church Website Enrichment Pipeline - FastAPI entrypoint.
+This is the FastAPI entry point for the Church Pipeline.
 
-Endpoints
----------
-Health
-    GET  /                -> status + registered tables
-    GET  /tables          -> table name -> column names
-
-Crawl (writes to DB)
-    POST /crawl           -> crawl one URL, persist, return the record
-    POST /crawl/batch     -> crawl many URLs sequentially, persist each
-
-Read (from DB)
-    GET  /churches              -> short list of every stored church
-    GET  /churches/{church_id}  -> full nested record (the crawl JSON shape)
+The routes live in three groups:
+  - Health: a quick "is it up?" check and a peek at the tables I have.
+  - Crawl: hits a URL (or a batch, or an uploaded CSV), runs the scraper, and saves the result.
+  - Read: pulls churches back out of the DB, either as a short list or the full nested record.
 """
 
-from fastapi import FastAPI, Depends, HTTPException
+import csv
+import io
+from pathlib import Path
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from database import engine, Base, get_db
@@ -28,6 +25,19 @@ from schemas import CrawlRequest, BatchCrawlRequest, ChurchSummary
 from services import crawl_and_persist
 
 
+def _normkey(u: str) -> str:
+    """Quick helper I use to compare two URLs/domains without getting tripped up
+    by http vs https, www., or a trailing slash."""
+    s = (u or "").strip().lower()
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    if s.startswith("www."):
+        s = s[4:]
+    return s.rstrip("/")
+
+
 app = FastAPI(
     title="Church Website Enrichment Pipeline",
     description=("Phase 1 API: crawls church websites, extracts identity "
@@ -36,10 +46,19 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# I serve the static folder under /static, and expose the page at /ui so
+# nobody has to type out the index.html filename.
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# --------------------------------------------------------------------------
-# Startup - ensure every model has a corresponding table
-# --------------------------------------------------------------------------
+
+@app.get("/ui", include_in_schema=False)
+def ui():
+    """Just hands back the single-page UI I built for browsing the data."""
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+# On startup I make sure every model I declared actually has its table.
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
@@ -49,9 +68,7 @@ def on_startup():
     print("--- Ready ---\n")
 
 
-# --------------------------------------------------------------------------
-# Health
-# --------------------------------------------------------------------------
+# Health endpoints — small things I use to confirm the API is alive.
 @app.get("/", tags=["Health"])
 def root():
     return {
@@ -70,13 +87,11 @@ def list_tables():
     }
 
 
-# --------------------------------------------------------------------------
-# Crawl
-# --------------------------------------------------------------------------
+# Crawl endpoints — these actually do the scraping and write to the DB.
 @app.post("/crawl", tags=["Crawl"])
 def crawl_one(payload: CrawlRequest, db: Session = Depends(get_db)):
-    """Crawl a single church website, persist the result, and return the
-    nested JSON record."""
+    """Scrape one church website, save what I find, and send back the
+    full record."""
     record = crawl_and_persist(
         url=payload.url,
         db=db,
@@ -88,8 +103,8 @@ def crawl_one(payload: CrawlRequest, db: Session = Depends(get_db)):
 
 @app.post("/crawl/batch", tags=["Crawl"])
 def crawl_many(payload: BatchCrawlRequest, db: Session = Depends(get_db)):
-    """Crawl a list of URLs sequentially. Returns a small summary per URL;
-    full records are available via GET /churches/{id}."""
+    """Walks through a list of URLs one after the other. I only return a small
+    summary per URL here — to see the full data, use GET /churches/{id}."""
     summary = []
     for idx, url in enumerate(payload.urls, 1):
         try:
@@ -115,13 +130,102 @@ def crawl_many(payload: BatchCrawlRequest, db: Session = Depends(get_db)):
     return {"count": len(summary), "results": summary}
 
 
-# --------------------------------------------------------------------------
-# Read
-# --------------------------------------------------------------------------
+# Bulk upload — the boss wanted a way to drop a whole CSV in at once and
+# only crawl what I haven't seen yet, so this is that.
+@app.post("/crawl/upload", tags=["Crawl"])
+async def crawl_upload(
+    file: UploadFile = File(...),
+    limit: int = Form(100),
+    enable_llm: bool = Form(True),
+    db: Session = Depends(get_db),
+):
+    """Takes a CSV (the URL goes in the first column, header row optional),
+    skips any URL I've already crawled before, and runs up to `limit` of the
+    fresh ones. Each one gets saved as it finishes."""
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"Could not decode upload: {exc}")
+
+    reader = csv.reader(io.StringIO(text))
+    candidate_urls: list[str] = []
+    seen_in_csv: set[str] = set()
+    for row in reader:
+        if not row:
+            continue
+        url = (row[0] or "").strip()
+        if not url or url.lower() in {"url", "website", "domain"}:
+            continue  # blank cells and an obvious header row both skip here
+        key = _normkey(url)
+        if key in seen_in_csv:
+            continue
+        seen_in_csv.add(key)
+        candidate_urls.append(url)
+
+    # Pull every URL/domain I've already saved so I can dedupe against them.
+    existing_rows = db.query(
+        Church.website_url_original, Church.final_domain
+    ).all()
+    existing_keys: set[str] = set()
+    for orig, dom in existing_rows:
+        if orig:
+            existing_keys.add(_normkey(orig))
+        if dom:
+            existing_keys.add(dom.lower().rstrip("/"))
+
+    fresh_urls: list[str] = []
+    skipped = 0
+    for url in candidate_urls:
+        key = _normkey(url)
+        # I also strip the path off, so example.com/foo still matches example.com.
+        bare = key.split("/")[0]
+        if key in existing_keys or bare in existing_keys:
+            skipped += 1
+            continue
+        fresh_urls.append(url)
+
+    to_crawl = fresh_urls[:limit]
+    results = []
+    for idx, url in enumerate(to_crawl, 1):
+        try:
+            record = crawl_and_persist(
+                url=url,
+                db=db,
+                source_row_id=f"upload_{idx:04d}",
+                enable_llm=enable_llm,
+            )
+            results.append({
+                "url": url,
+                "church_name": record.get("church_name"),
+                "final_domain": record.get("final_domain"),
+                "crawl_status": record.get("crawl_status"),
+                "confidence_score": record.get("confidence_score"),
+            })
+        except Exception as exc:
+            results.append({
+                "url": url,
+                "crawl_status": "failed",
+                "error": f"{exc.__class__.__name__}: {exc}",
+            })
+
+    return {
+        "filename": file.filename,
+        "rows_in_csv": len(candidate_urls),
+        "skipped_already_in_db": skipped,
+        "eligible_new": len(fresh_urls),
+        "limit": limit,
+        "attempted": len(to_crawl),
+        "results": results,
+    }
+
+
+# Read endpoints — these just pull data back out, no scraping involved.
 @app.get("/churches", response_model=list[ChurchSummary], tags=["Churches"])
 def list_churches(db: Session = Depends(get_db),
                   limit: int = 100, offset: int = 0):
-    """Short list of every church stored in the database."""
+    """A short summary of every church I have stored, newest first."""
     rows = (
         db.query(Church)
           .order_by(Church.id.desc())
@@ -134,13 +238,15 @@ def list_churches(db: Session = Depends(get_db),
 
 @app.get("/churches/{church_id}", tags=["Churches"])
 def get_church(church_id: int, db: Session = Depends(get_db)):
-    """Return one church in the same nested shape as the crawler's JSON."""
+    """Returns a single church in the same nested JSON shape my crawler produces,
+    so the frontend doesn't have to care whether the data came from the DB or a
+    fresh crawl."""
     church = db.query(Church).filter(Church.id == church_id).first()
     if church is None:
         raise HTTPException(status_code=404, detail="Church not found")
 
-    # Rehydrate a JSON-style record from the SQLAlchemy relationships so
-    # the endpoint matches the shape that `crawl_site` returns.
+    # I rebuild the nested JSON from the SQLAlchemy relationships here, so what
+    # the API returns matches exactly what crawl_site produced in the first place.
     social = {p: None for p in ("instagram", "facebook", "youtube", "x",
                                 "threads", "tiktok", "linkedin")}
     extras: list[str] = []
@@ -218,7 +324,8 @@ def get_church(church_id: int, db: Session = Depends(get_db)):
 
 @app.get("/churches/{church_id}/html", tags=["Churches"])
 def get_church_html(church_id: int, db: Session = Depends(get_db)):
-    """Return the stored homepage HTML snapshot(s) for a church."""
+    """Sends back the raw HTML I saved when I crawled this church's homepage.
+    Useful when I want to double-check what the site actually looked like."""
     pages = (
         db.query(RawHTML)
           .filter(RawHTML.church_id == church_id)

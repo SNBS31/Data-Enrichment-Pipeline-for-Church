@@ -10,14 +10,14 @@ class Church(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     
-    # Core Identity 
+    # Who is this church
     source_row_id = Column(String, nullable=True)
     church_name = Column(String, nullable=True)
     website_url_original = Column(String, nullable=False)
     website_url_normalized = Column(String, nullable=True)
     final_domain = Column(String, nullable=True)
-    
-    # Crawl Metadata
+
+    # Bookkeeping I keep about the crawl itself
     crawl_status = Column(String, nullable=True)
     crawl_notes = Column(String, nullable=True)
     confidence_score = Column(Float, nullable=True)
@@ -26,12 +26,12 @@ class Church(Base):
     sitemap_found = Column(Boolean, default=False)
     sitemap_url = Column(String, nullable=True)
     pages_sampled_count = Column(Integer, default=0)
-    
-    # Timestamps 
+
+    # When the row was first written / last touched
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
-    
-    # Relationships
+
+    # All the child tables hang off here. Cascade delete keeps things tidy.
     social_links = relationship("SocialLink", back_populates="church", cascade="all, delete-orphan")
     mobile_app = relationship("MobileApp", back_populates="church", uselist=False, cascade="all, delete-orphan")
     main_menu_items = relationship("MainMenu", back_populates="church", cascade="all, delete-orphan")
@@ -120,7 +120,8 @@ class AdditionalInfo(Base):
     __tablename__ = "additional_info"
 
     id = Column(Integer, primary_key=True, index=True)
-    # Many key/value rows per church - no unique constraint
+    # I store loose key/value pairs here, so one church can have many rows —
+    # no uniqueness constraint on purpose.
     church_id = Column(Integer, ForeignKey("churches.id"), nullable=False)
     key = Column(String, nullable=True)
     value = Column(Text, nullable=True)

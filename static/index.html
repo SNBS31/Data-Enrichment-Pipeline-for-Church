@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Church Pipeline — Data Browser</title>
+  <!-- I'm pulling Tailwind off the CDN so I don't have to deal with a build step. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-800">
+
+  <div class="max-w-6xl mx-auto p-6">
+    <h1 class="text-2xl font-bold mb-1">Church Pipeline — Data Browser</h1>
+    <p class="text-sm text-slate-500 mb-6" id="stats">loading…</p>
+
+    <!-- Single-URL crawl box, plus the bulk-upload trigger sitting next to it. -->
+    <div class="bg-white border rounded-lg p-4 mb-6 flex gap-2">
+      <input id="crawl-url" type="text" placeholder="Crawl a new URL, e.g. fbclabelle.org"
+             class="flex-1 border rounded px-3 py-2 text-sm" />
+      <button id="crawl-btn" onclick="crawlNew()"
+              class="bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded text-sm font-medium">
+        Crawl
+      </button>
+      <button id="bulk-btn" onclick="openBulkModal()"
+              class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded text-sm font-medium">
+        Bulk Upload CSV
+      </button>
+    </div>
+
+    <!-- The popup that appears when "Bulk Upload CSV" is clicked. -->
+    <div id="bulk-modal"
+         class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center">
+      <div class="bg-white rounded-lg shadow-xl w-full max-w-md p-6">
+        <div class="flex justify-between items-start mb-4">
+          <h3 class="text-lg font-bold">Bulk Upload CSV</h3>
+          <button onclick="closeBulkModal()" class="text-slate-400 hover:text-slate-700 text-xl leading-none">&times;</button>
+        </div>
+        <p class="text-xs text-slate-500 mb-3">
+          Drop in a CSV that has the website URL in column 1. Anything I've
+          already crawled gets skipped, so you can re-upload the same file.
+        </p>
+        <label class="block text-xs font-semibold text-slate-600 mb-1">CSV file</label>
+        <input id="bulk-file" type="file" accept=".csv,text/csv"
+               class="w-full text-sm border rounded px-2 py-1 mb-3" />
+
+        <label class="block text-xs font-semibold text-slate-600 mb-1">Limit (max URLs to crawl)</label>
+        <input id="bulk-limit" type="number" value="100" min="1"
+               class="w-full text-sm border rounded px-2 py-1 mb-3" />
+
+        <label class="flex items-center gap-2 text-sm mb-4">
+          <input id="bulk-llm" type="checkbox" checked />
+          Use the LLM (slower but the names/addresses come out much cleaner)
+        </label>
+
+        <div class="flex justify-end gap-2">
+          <button onclick="closeBulkModal()"
+                  class="px-3 py-2 text-sm rounded border">Cancel</button>
+          <button id="bulk-submit" onclick="submitBulk()"
+                  class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded text-sm font-medium">
+            Upload &amp; Crawl
+          </button>
+        </div>
+        <div id="bulk-status" class="mt-3 text-sm text-slate-600"></div>
+      </div>
+    </div>
+
+    <div class="grid md:grid-cols-3 gap-6">
+
+      <!-- Left column: every church I've stored, as clickable cards. -->
+      <aside class="md:col-span-1">
+        <h2 class="text-xs font-semibold text-slate-500 uppercase mb-2">Churches</h2>
+        <div id="church-list" class="space-y-2"></div>
+      </aside>
+
+      <!-- Right column: the full breakdown of whichever church I clicked. -->
+      <section class="md:col-span-2" id="detail">
+        <p class="text-slate-500">Pick a church on the left to see its full data.</p>
+      </section>
+
+    </div>
+  </div>
+
+  <script>
+    let churches = [];
+    let activeId = null;
+
+    // Pull the list of stored churches from the API and paint the sidebar.
+    async function loadChurches() {
+      const res = await fetch("/churches");
+      churches = await res.json();
+      document.getElementById("stats").textContent =
+        `${churches.length} churches in database`;
+      renderList();
+    }
+
+    function renderList() {
+      document.getElementById("church-list").innerHTML = churches.map(c => `
+        <div onclick="showChurch(${c.id})"
+             class="bg-white border rounded-lg p-3 cursor-pointer hover:bg-slate-100
+                    ${c.id === activeId ? 'border-sky-500 border-2' : ''}">
+          <div class="font-semibold">${esc(c.church_name || '(unnamed)')}</div>
+          <div class="text-xs text-slate-500">${esc(c.final_domain || '')}</div>
+          <span class="inline-block text-xs px-2 py-0.5 rounded mt-1
+                       ${c.crawl_status === 'complete'
+                         ? 'bg-green-100 text-green-800'
+                         : 'bg-red-100 text-red-800'}">
+            ${c.crawl_status || 'unknown'} · ${c.confidence_score ?? '–'}
+          </span>
+        </div>
+      `).join("");
+    }
+
+    // When a card is clicked, fetch that one church and render the detail panel.
+    async function showChurch(id) {
+      activeId = id;
+      renderList();
+      const detail = document.getElementById("detail");
+      detail.innerHTML = `<p class="text-slate-500">Loading…</p>`;
+      try {
+        const res = await fetch(`/churches/${id}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const c = await res.json();
+        detail.innerHTML = renderDetail(c);
+      } catch (e) {
+        detail.innerHTML = `<p class="text-red-600">Failed: ${esc(e.message)}</p>`;
+      }
+    }
+
+    function renderDetail(c) {
+      const social = c.social || {};
+      const socialPills = Object.entries(social)
+        .filter(([k, v]) => k !== "other_social_urls" && v)
+        .map(([k, v]) => `<a href="${v}" target="_blank"
+              class="bg-slate-200 hover:bg-slate-300 text-xs px-2 py-1 rounded">${k}</a>`)
+        .join(" ");
+
+      const menu = c.main_menu || { items: [], urls: [] };
+      const menuRows = menu.items.map((label, i) => `
+        <div class="flex justify-between text-sm py-1 border-b last:border-0">
+          <span>${esc(label)}</span>
+          <a href="${menu.urls[i]}" target="_blank" class="text-sky-600 truncate ml-2">
+            ${esc(menu.urls[i] || '')}</a>
+        </div>`).join("");
+
+      const keyPagesRows = Object.entries(c.key_pages || {}).map(([type, url]) => `
+        <div class="flex justify-between text-sm py-1 border-b last:border-0">
+          <span>${esc(type)}</span>
+          <a href="${url}" target="_blank" class="text-sky-600 truncate ml-2">${esc(url)}</a>
+        </div>`).join("");
+
+      const additional = c.additional || {};
+      const addRows = Object.entries(additional).map(([k, v]) => `
+        <div class="flex gap-4 text-sm py-1 border-b last:border-0">
+          <span class="text-slate-500 w-64 shrink-0 break-words">${esc(k)}</span>
+          <span class="break-all">${esc(String(v))}</span>
+        </div>`).join("");
+
+      return `
+        <h2 class="text-2xl font-bold">${esc(c.church_name || '(unnamed)')}</h2>
+        <p class="text-sm text-slate-500 mb-4">
+          <a href="${c.website_url_normalized || c.website_url_original}" target="_blank"
+             class="text-sky-600">${esc(c.final_domain || '')}</a>
+          · status: ${esc(c.crawl_status || '')}
+          · confidence: ${c.confidence_score ?? '–'}
+        </p>
+
+        ${card("Social", socialPills || '<span class="text-slate-400">none</span>')}
+
+        ${c.mobile_app ? card("Mobile App", `
+          ${kv("Apple App Store", linkOrDash(c.mobile_app.apple_app_store_url))}
+          ${kv("Google Play",     linkOrDash(c.mobile_app.google_play_url))}
+          ${kv("App name",        esc(c.mobile_app.app_name || '–'))}`) : ''}
+
+        ${card(`Main Menu (${menu.items.length})`, menuRows || '<span class="text-slate-400">none</span>')}
+        ${card("Key Pages", keyPagesRows || '<span class="text-slate-400">none</span>')}
+
+        ${c.prayer ? card("Prayer", `
+          ${kv("Prayer page",  linkOrDash(c.prayer.prayer_page_url))}
+          ${kv("Has page",     c.prayer.has_prayer_page ? 'yes' : 'no')}
+          ${kv("Has form",     c.prayer.has_prayer_form ? 'yes' : 'no')}`) : ''}
+
+        ${c.giving ? card("Giving", `
+          ${kv("Giving page",  linkOrDash(c.giving.giving_page_url))}
+          ${kv("Provider",     esc(c.giving.provider_detected || '–'))}
+          ${kv("Has page",     c.giving.has_giving_page ? 'yes' : 'no')}`) : ''}
+
+        ${card(`Additional (${Object.keys(additional).length})`, addRows)}
+
+        ${card("Raw HTML",
+          `<a href="/churches/${c.id}/html" target="_blank" class="text-sky-600">View stored HTML →</a>`)}
+      `;
+    }
+
+    // Handler for the single-URL Crawl button at the top of the page.
+    async function crawlNew() {
+      const url = document.getElementById("crawl-url").value.trim();
+      const btn = document.getElementById("crawl-btn");
+      if (!url) return alert("Enter a URL first");
+      btn.disabled = true;
+      btn.textContent = "Crawling…";
+      try {
+        const res = await fetch("/crawl", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ url, enable_llm: true }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const record = await res.json();
+        document.getElementById("crawl-url").value = "";
+        await loadChurches();
+        const fresh = churches.find(c => c.final_domain === record.final_domain);
+        if (fresh) showChurch(fresh.id);
+      } catch (e) {
+        alert(`Crawl failed: ${e.message}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Crawl";
+      }
+    }
+
+    // Bulk-upload modal: open/close + the actual submit-to-/crawl/upload call.
+    function openBulkModal() {
+      document.getElementById("bulk-modal").classList.remove("hidden");
+      document.getElementById("bulk-status").textContent = "";
+    }
+    function closeBulkModal() {
+      document.getElementById("bulk-modal").classList.add("hidden");
+    }
+    async function submitBulk() {
+      const fileEl = document.getElementById("bulk-file");
+      const limit  = document.getElementById("bulk-limit").value || 100;
+      const llm    = document.getElementById("bulk-llm").checked;
+      const btn    = document.getElementById("bulk-submit");
+      const status = document.getElementById("bulk-status");
+      if (!fileEl.files.length) { alert("Pick a CSV first"); return; }
+
+      const fd = new FormData();
+      fd.append("file", fileEl.files[0]);
+      fd.append("limit", limit);
+      fd.append("enable_llm", llm ? "true" : "false");
+
+      btn.disabled = true;
+      btn.textContent = "Crawling…";
+      status.textContent = "Uploading and crawling now. This can take a while.";
+      try {
+        const res = await fetch("/crawl/upload", { method: "POST", body: fd });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const out = await res.json();
+        status.innerHTML =
+          `<span class="text-green-700 font-medium">Done.</span> ` +
+          `CSV rows: ${out.rows_in_csv} · skipped (already in DB): ${out.skipped_already_in_db} · ` +
+          `attempted: ${out.attempted}`;
+        await loadChurches();
+      } catch (e) {
+        status.innerHTML = `<span class="text-red-600">Failed: ${esc(e.message)}</span>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Upload & Crawl";
+      }
+    }
+
+    // A handful of tiny helpers I reuse across the renderers above.
+    const card = (title, body) => `
+      <div class="bg-white border rounded-lg p-4 mb-3">
+        <h3 class="text-xs font-semibold uppercase text-slate-500 mb-2">${title}</h3>
+        <div>${body}</div>
+      </div>`;
+    const kv = (k, v) => `
+      <div class="flex gap-4 text-sm py-1 border-b last:border-0">
+        <span class="text-slate-500 w-48 shrink-0 break-words">${k}</span>
+        <span class="break-all">${v}</span>
+      </div>`;
+    const linkOrDash = (u) => u
+      ? `<a href="${u}" target="_blank" class="text-sky-600 break-all">${esc(u)}</a>`
+      : '–';
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c =>
+      ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+    loadChurches();
+  </script>
+</body>
+</html>

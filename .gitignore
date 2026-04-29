@@ -1,12 +1,32 @@
-# Virtual environment
+# Virtual env
 venv/
 
-# SQLite database
-*.db
-
-# Python cache
+# Python bytecode
 __pycache__/
 *.pyc
+*.pyo
 
-# Environment variables
+# Local SQLite DB
+church_pipeline.db
+*.db
+
+# Downloaded LLM weights (~1 GB)
+models/
+
+# Per-run JSON dumps
+crawl_output/
+
+# Test artefacts
+upload_test_100.json
+
+# Secrets
 .env
+
+# Claude Code local config
+.claude/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

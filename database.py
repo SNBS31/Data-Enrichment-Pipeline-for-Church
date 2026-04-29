@@ -9,14 +9,14 @@ Base = declarative_base()
 
 class DbConnection:
     """
-    So from this "Singleton"(design pattern)
-    database connection manager,
-    No matter how many times DbConnection() is called,
-    only ONE instance will ever exist. This guarantees
-    one engine, one session factory, one connection pool.
+    My DB connection manager, written as a Singleton on purpose so that no
+    matter where DbConnection() gets called from in the project, I'm always
+    talking to the same engine, the same session factory, and the same
+    connection pool.
 
-    Checks first for DATABASE_URL from .env.
-    If PostgreSQL is present, use it. Otherwise, fallback to SQLite.
+    I look for DATABASE_URL in .env first; if it's there I use Postgres,
+    otherwise I drop down to a local SQLite file so the app still runs even
+    when nothing is configured.
     """
 
     _instance = None
@@ -34,10 +34,10 @@ class DbConnection:
         self.database_url = os.getenv("DATABASE_URL")
 
         if self.database_url:
-            # PostgreSQL I had set from my .env file
+            # If I set DATABASE_URL in .env, use that (Postgres in my case).
             self.engine = create_engine(self.database_url)
         else:
-            # Fallback but to SQLite, stored but as a local file
+            # Otherwise just use a local SQLite file — keeps things simple.
             self.database_url = "sqlite:///./church_pipeline.db"
             self.engine = create_engine(self.database_url, connect_args={"check_same_thread": False})
 
@@ -46,7 +46,8 @@ class DbConnection:
         self._initialized = True
 
     def get_db(self):
-        # The FastAPI dependency yields a session, and closes it when it's done
+        # FastAPI dependency: hand out a session, then close it once the
+        # request is done so I don't leak connections.
         db = self.SessionLocal()
         try:
             yield db
@@ -54,8 +55,8 @@ class DbConnection:
             db.close()
 
 
-# Singleton instance — even if someone calls DbConnection() elsewhere,
-# they get this same object back.
+# Module-level handles. Anyone calling DbConnection() from elsewhere gets
+# the same instance back, so these stay valid project-wide.
 db_connection = DbConnection()
 engine = db_connection.engine
 SessionLocal = db_connection.SessionLocal

@@ -27,3 +27,4 @@ huggingface_hub==1.10.2
 requests
 beautifulsoup4
 lxml
+python-multipart

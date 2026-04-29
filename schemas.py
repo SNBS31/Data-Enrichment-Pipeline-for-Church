@@ -1,7 +1,9 @@
 """
-Pydantic request/response schemas for the Church Pipeline API.
-Kept deliberately small - the crawler's JSON payload is already
-well-structured, so most responses reuse its shape via `dict`.
+Pydantic models for the API requests and responses.
+
+I kept this file short on purpose. The crawler already returns a clean
+nested JSON, so for most read endpoints I just return the dict directly
+instead of writing a Pydantic model for every shape.
 """
 
 from typing import Optional
@@ -9,26 +11,26 @@ from pydantic import BaseModel, Field
 
 
 class CrawlRequest(BaseModel):
-    """Body for POST /crawl - a single URL."""
-    url: str = Field(..., description="Full URL or bare domain, e.g. 'example.org'")
+    """The body I expect on POST /crawl — just one URL at a time."""
+    url: str = Field(..., description="Full URL or just the domain, e.g. 'example.org'.")
     source_row_id: Optional[str] = Field(
         default="api",
-        description="Identifier copied into the stored record (optional).",
+        description="Optional tag I copy onto the saved row, useful for tracking source.",
     )
     enable_llm: bool = Field(
         default=True,
-        description="If False, skip the Qwen model and use rule-based extraction.",
+        description="Set to False if I want to skip Qwen and use the regex fallbacks.",
     )
 
 
 class BatchCrawlRequest(BaseModel):
-    """Body for POST /crawl/batch - many URLs at once."""
-    urls: list[str] = Field(..., min_length=1, description="List of URLs to crawl.")
+    """Body for POST /crawl/batch — a list of URLs to chew through."""
+    urls: list[str] = Field(..., min_length=1, description="The URLs I want crawled.")
     enable_llm: bool = True
 
 
 class ChurchSummary(BaseModel):
-    """Short form used by GET /churches (listing)."""
+    """Compact shape used by the listing endpoint, GET /churches."""
     id: int
     church_name: Optional[str] = None
     final_domain: Optional[str] = None

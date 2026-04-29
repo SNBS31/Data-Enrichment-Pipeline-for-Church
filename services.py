@@ -1,20 +1,22 @@
 """
-Church Website Intelligence Pipeline
-------------------------------------
-For each church website in the source CSV, this module produces a
-structured JSON record capturing:
+This is the brains of the project — the actual scraper.
 
-    * identity        - official name, normalised URL, final domain
-    * contact         - address, phone, email
-    * navigation      - main-menu labels and URLs
-    * key pages       - about, sermons, giving, prayer, events, etc.
-    * feature flags   - live stream, multi-site, mobile app, giving provider
-    * crawl metadata  - timestamps, confidence score, robots/sitemap status
+For every church URL it gets, it spits out one nested JSON record covering:
+  - identity stuff (official name, normalised URL, final domain)
+  - contact info (address, phone, email)
+  - the main navigation labels and where they point
+  - the "key pages" I care about (about, sermons, giving, prayer, events, …)
+  - feature flags (live stream? mobile app? multi-site? which giving provider?)
+  - crawl bookkeeping (timestamps, my confidence score, robots/sitemap status)
 
-The deterministic parts (URL work, link harvesting, menu parsing) use
-BeautifulSoup + requests. The fuzzy parts (name / address / phone / email /
-CMS / live-stream / multi-site / prayer-page type) are delegated to a local
-Qwen2.5-1.5B-Instruct model exposed through transformers.pipeline.
+Two layers do the work:
+
+  - The "boring" deterministic stuff (URL cleanup, harvesting links, parsing
+    the menu) goes through BeautifulSoup and requests.
+  - The fuzzier stuff (real name, address, phone, email, CMS guess, live-stream
+    detection, multi-site detection, prayer-page classification) gets handed
+    to a local Qwen2.5-1.5B-Instruct model. My boss wanted every fuzzy field
+    coming from an actual LLM, not regex, so that's what this does.
 """
 
 import csv
@@ -34,9 +36,10 @@ from bs4 import BeautifulSoup
 from urllib3.exceptions import InsecureRequestWarning
 from sqlalchemy.orm import Session
 
-# Torch-free LLM runtime. llama-cpp-python ships prebuilt wheels and does
-# not depend on PyTorch, so it avoids the torch 2.11.0+cpu segfault that
-# `transformers.pipeline` hits on Windows when loading Qwen2.5-1.5B.
+# I went with llama-cpp-python instead of transformers + torch. The reason is
+# that on Windows, torch 2.11.0+cpu segfaults (exit 139) the moment I try to
+# load Qwen2.5-1.5B through transformers.pipeline. llama-cpp ships prebuilt
+# wheels, runs the same model from a GGUF file, and skips that whole headache.
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
@@ -46,22 +49,22 @@ from models import (
 )
 
 
-# Self-signed / expired certs are common on small church sites; we silence
-# the noisy warning because verify=False is a deliberate choice here.
+# A lot of small church sites have self-signed or expired certs. I'm fine with
+# that for crawling, so I turn TLS verification off and silence the warning
+# urllib3 keeps shouting about it.
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
 
-# ==========================================================================
-# Request plumbing
-# ==========================================================================
+# ----- HTTP plumbing -----
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ChurchIntel/1.0"
-T_HOMEPAGE = 15       # full page loads
-T_SECONDARY = 10      # sub-pages
-T_PROBE = 5           # robots.txt / sitemap HEAD checks
+T_HOMEPAGE = 15       # how long I wait for the homepage
+T_SECONDARY = 10      # for sub-pages I follow into
+T_PROBE = 5           # quick HEAD-style checks (robots.txt, sitemap)
 
 
 def _http() -> requests.Session:
-    """Pre-configured session: browser UA, TLS errors ignored."""
+    """My standard requests session — browser-y UA and no TLS verification,
+    so the wonky church certs out there don't break the whole crawl."""
     s = requests.Session()
     s.headers.update({"User-Agent": BROWSER_UA})
     s.verify = False
@@ -69,7 +72,8 @@ def _http() -> requests.Session:
 
 
 def drop_www(url: Optional[str]) -> Optional[str]:
-    """Return the URL with any leading 'www.' removed from the host."""
+    """Strips a leading 'www.' off the host. Keeps things consistent so I'm not
+    storing both example.com and www.example.com as if they were different."""
     if not url:
         return url
     try:
@@ -82,28 +86,27 @@ def drop_www(url: Optional[str]) -> Optional[str]:
         return url
 
 
-# ==========================================================================
-# LLM agent - wraps Qwen2.5-1.5B-Instruct behind focused extraction methods
-# ==========================================================================
-# The model is the quantised GGUF build of Qwen2.5-1.5B-Instruct, pulled
-# once from HuggingFace and cached on disk. llama-cpp-python loads it
-# without touching PyTorch, which side-steps the torch 2.11.0+cpu
-# Segmentation fault (exit 139) observed on Windows.
+# ----- The LLM "agent" -----
+# Wraps Qwen2.5-1.5B-Instruct behind a small set of single-purpose methods.
+# I download the quantised GGUF once from HuggingFace and cache it on disk;
+# from then on llama-cpp-python loads it locally with no PyTorch involved,
+# which avoids the torch segfault I keep running into on Windows.
 GGUF_REPO     = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 GGUF_FILENAME = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 GGUF_LOCAL_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 
 class ChurchIntelAgent:
-    """Singleton wrapping the Qwen model via llama-cpp-python. Each public
-    method performs one well-scoped extraction and returns a plain Python
-    value (str / bool / dict). Callers never touch the model directly.
+    """One Singleton wrapper around Qwen, exposed through llama-cpp-python.
 
-    If the GGUF model cannot be loaded, every method falls back to a
-    carefully-tuned rule-based extractor so the pipeline still returns a
-    complete record - but in normal operation the LLM is the primary
-    source of every fuzzy field (name / address / phone / email / CMS /
-    live stream / multisite / prayer classification)."""
+    Each method handles one specific question (church name, address, phone,
+    etc.) and returns a plain Python value, so the rest of the code never has
+    to know it's talking to an LLM.
+
+    If the GGUF can't load for whatever reason, every method quietly drops
+    down to a hand-tuned regex/keyword fallback so the pipeline still
+    finishes. But under normal conditions the LLM is what's actually filling
+    in every fuzzy field — that's how my boss wants it."""
 
     _instance = None
 
@@ -138,7 +141,8 @@ class ChurchIntelAgent:
         cls._instance = obj
         return obj
 
-    # -- thin generation helper, shared by every extractor ---------------
+    # Tiny shared helper — every extractor below calls this to actually talk
+    # to the model. Saves me copy-pasting the chat-completion boilerplate.
     def _ask(self, system: str, user: str, max_tokens: int = 30) -> str:
         if not self.llm_enabled or self.llm is None:
             return ""
@@ -155,11 +159,12 @@ class ChurchIntelAgent:
         except Exception as err:
             print(f"[agent] generation failed: {err}")
             return ""
-        # Keep just the first line; strip surrounding quotes and whitespace.
+        # The model sometimes pads with extra lines or wraps things in quotes,
+        # so I keep only the first line and strip quotes/whitespace off it.
         first = text.splitlines()[0] if text else ""
         return first.strip().strip('"\'').strip()
 
-    # -- field-level extractors ------------------------------------------
+    # ----- The actual field extractors -----
     def identify_church_name(self, header: str, footer: str) -> str:
         if self.llm_enabled:
             system = (
@@ -171,8 +176,9 @@ class ChurchIntelAgent:
             answer = self._ask(system, user, max_tokens=30)
             if len(answer) >= 3 and answer.lower() not in {"home", "welcome", "church"}:
                 return answer
-        # When the LLM is unavailable, return empty so the caller falls back
-        # to the cleaned <title> tag (more reliable than regex on nav text).
+        # If the LLM is off or didn't give me anything trustworthy, I just
+        # return empty — the caller will then use the cleaned <title> tag,
+        # which I've found more reliable than regex over nav text.
         return ""
 
     def find_address(self, body: str) -> str:
@@ -275,9 +281,10 @@ class ChurchIntelAgent:
         return _rule_prayer_classify(prayer_html)
 
 
-# ==========================================================================
-# Rule-based extractors (used as fallbacks when the LLM is unavailable)
-# ==========================================================================
+# ----- Regex/keyword fallbacks -----
+# These only kick in when the LLM is off or when its answer didn't validate.
+# I keep them around so the pipeline still produces something useful even on
+# a machine that can't load the model.
 _CHURCH_TAIL = re.compile(
     r"\b([A-Z][A-Za-z'&.\-]+(?:\s+[A-Z][A-Za-z'&.\-]+){0,5}\s+"
     r"(?:Church|Chapel|Fellowship|Ministries|Cathedral|Parish|Assembly|"
@@ -304,7 +311,7 @@ def _rule_address(text: str) -> str:
     m = _ADDR_RE.search(text[:4000])
     if not m:
         return ""
-    # Normalise whitespace
+    # Collapse weird whitespace so the result reads cleanly.
     return re.sub(r"\s+", " ", m.group(0)).strip(" ,")
 
 
@@ -324,7 +331,8 @@ def _rule_email(text: str) -> str:
     found = _EMAIL_RE.findall(text[:4000])
     if not found:
         return ""
-    # Prefer generic contact addresses when several exist
+    # If a page has several emails, I'd rather pick info@/contact@/etc.
+    # than someone's personal address.
     for pref in _PREFER_EMAIL:
         for e in found:
             if e.lower().startswith(pref + "@") or e.lower().startswith(pref):
@@ -378,8 +386,8 @@ def _rule_prayer_classify(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
     low = html.lower()
     has_form = bool(soup.find("form")) or "prayer request" in low
-    # "wall" heuristic: many repeated small blocks with "Pray" buttons, OR
-    # a container hosting submitted requests
+    # Quick heuristic for a "prayer wall": either lots of repeated "pray for"
+    # blocks, or visible markup that looks like a feed of submitted requests.
     wall_hits = sum(1 for _ in re.finditer(r"\bpray for\b", low))
     wall_hits += sum(1 for _ in re.finditer(r"class=[\"'][^\"']*prayer-request", low))
     is_wall = wall_hits >= 3
@@ -400,11 +408,10 @@ def _rule_prayer_classify(html: str) -> dict:
     }
 
 
-# ==========================================================================
-# HTTP helpers
-# ==========================================================================
+# ----- HTTP helpers -----
 def fetch_html(url: str, timeout: int = T_SECONDARY) -> Optional[str]:
-    """Download a single URL and return its HTML body, or None on failure."""
+    """Pull down one URL and hand back the HTML body. If anything goes wrong
+    (timeout, 404, DNS fail, whatever) I just return None and log it."""
     try:
         resp = _http().get(url, timeout=timeout)
         resp.raise_for_status()
@@ -415,11 +422,13 @@ def fetch_html(url: str, timeout: int = T_SECONDARY) -> Optional[str]:
 
 
 def resolve_url(raw: str) -> tuple[str, str]:
-    """Ensure scheme, follow redirects, strip www. -> (full_url, bare_host)."""
+    """Make sure the URL has a scheme, follow whatever redirects the site
+    throws at me, drop the 'www.' off, and return (full_url, bare_host)."""
     start = raw if raw.startswith(("http://", "https://")) else f"https://{raw}"
     final = start
     try:
-        # stream=True so we don't pull the body just to learn the final URL
+        # stream=True so I find out the final URL without pulling down the
+        # whole body just to throw it away.
         with _http().get(start, allow_redirects=True, timeout=T_HOMEPAGE, stream=True) as r:
             final = r.url
     except Exception as err:
@@ -428,9 +437,9 @@ def resolve_url(raw: str) -> tuple[str, str]:
     return cleaned, urlparse(cleaned).netloc
 
 
-# ==========================================================================
-# Deterministic structured extractors
-# ==========================================================================
+# ----- Plain-old-deterministic extractors -----
+# This is the stuff that doesn't need an LLM. Mostly looking at <a> tags and
+# matching them against known patterns or domain lists.
 SOCIAL_DOMAIN_MAP = {
     "instagram.com": "instagram",
     "facebook.com":  "facebook",
@@ -444,7 +453,9 @@ SOCIAL_DOMAIN_MAP = {
 }
 
 def collect_social_urls(soup: BeautifulSoup, base_url: str) -> dict:
-    """Bucket every <a href> into a named social platform."""
+    """Walk every <a href> on the page and drop each one into a social-media
+    bucket (instagram, facebook, ...). Anything I don't recognise but still
+    looks social-ish goes into the catch-all 'other' list."""
     out = {k: None for k in ("instagram", "facebook", "youtube", "x",
                              "threads", "tiktok", "linkedin")}
     extras: set[str] = set()
@@ -502,7 +513,8 @@ def inspect_mobile_app(soup: BeautifulSoup, html: str, giving_provider: Optional
 NAV_CANDIDATES = ("nav", "header nav", ".main-navigation", ".primary-menu", ".menu-main")
 
 def parse_navigation(soup: BeautifulSoup, base_url: str) -> tuple[list[str], list[str]]:
-    """Return (menu_labels, menu_urls) from the page's main navigation."""
+    """Pull out the main menu and return two lists: the visible link labels
+    and the URLs they go to, in matching order."""
     nav = None
     for selector in NAV_CANDIDATES:
         nav = soup.select_one(selector)
@@ -557,9 +569,11 @@ KEY_PAGE_PATHS = {
 }
 
 def locate_key_pages(base_url: str, menu_urls: list[str], internal_links: set[str]) -> dict:
-    """For each known page category, pick the best URL (menu > path guess)."""
+    """For each category I care about (about, sermons, giving, prayer, ...),
+    pick the best URL I can find. I trust the main menu first, then fall
+    back to guessing common paths."""
     resolved: dict[str, str] = {}
-    # Pass 1: match menu URL paths against keyword lists
+    # Pass 1: scan menu URLs and try to recognise each one by keyword.
     for url in menu_urls:
         path = urlparse(url).path.lower()
         for page, words in KEY_PAGE_WORDS.items():
@@ -567,7 +581,8 @@ def locate_key_pages(base_url: str, menu_urls: list[str], internal_links: set[st
                 continue
             if any(w in path for w in words):
                 resolved[page] = url
-    # Pass 2: common paths, but only if they actually exist in internal links
+    # Pass 2: try the obvious paths (e.g. /give, /about), but only count them
+    # if I actually saw the same URL in the page's own internal links.
     for page, paths in KEY_PAGE_PATHS.items():
         if page in resolved:
             continue
@@ -633,12 +648,11 @@ def analyze_giving_info(giving_url: Optional[str]) -> dict:
     }
 
 
-# ==========================================================================
-# Small helpers
-# ==========================================================================
+# ----- Small odds-and-ends -----
 TITLE_SEPARATORS = ("|", "-", "\u2013", "\u2014", "\u00bb", ":", "\u2022")
 
-# Words that strongly hint a substring IS the church name.
+# These words are a strong tell that a chunk of text is actually the name
+# of the church (rather than, say, a navigation label).
 _NAME_HINT_WORDS = re.compile(
     r"\b(church|chapel|fellowship|ministries|ministry|cathedral|parish|"
     r"assembly|tabernacle|temple|sanctuary|baptist|methodist|lutheran|"
@@ -647,7 +661,8 @@ _NAME_HINT_WORDS = re.compile(
     re.IGNORECASE,
 )
 
-# Words that almost never belong to a church's real name.
+# And these are dead giveaways that something is NOT the real name —
+# generic page labels I want to throw out before guessing.
 _NAME_REJECT_WORDS = re.compile(
     r"^(staff|home|welcome|about|about us|contact|contact us|"
     r"index|sermons|give|donate|prayer|events|calendar)$",
@@ -655,31 +670,33 @@ _NAME_REJECT_WORDS = re.compile(
 )
 
 def simplify_title(title: Optional[str]) -> Optional[str]:
-    """Split a '<title>' string on common separators and return the best
-    candidate. Heuristic: prefer parts that contain a church-related word
-    (e.g. 'Church', 'Baptist'); if none match, fall back to the longest
-    non-blank part that is not a generic word like 'Home' or 'Staff'."""
+    """Take a raw <title> string, split it on the usual separators (|, -, etc.)
+    and pick the segment that's most likely the actual church name.
+
+    My rule of thumb: first try segments that contain a church-y word
+    ('Church', 'Baptist', and so on). If nothing matches, fall back to the
+    longest segment that isn't a generic word like 'Home' or 'Staff'."""
     if not title:
         return None
     text = title.strip()
-    # Build the list of candidate segments by splitting on every known sep.
+    # Slice the title on every known separator until I have a flat list.
     segments = [text]
     for sep in TITLE_SEPARATORS:
         segments = [piece.strip() for seg in segments for piece in seg.split(sep)]
     segments = [s for s in segments if s]
     if not segments:
         return None
-    # First try: segments that look like a church name.
+    # First go: anything that smells like a church name and isn't generic.
     hinted = [s for s in segments
               if _NAME_HINT_WORDS.search(s) and not _NAME_REJECT_WORDS.match(s)]
     if hinted:
-        # Prefer the longest such segment (more specific).
+        # Of those, the longest is usually the most specific — go with it.
         return max(hinted, key=len)
-    # Otherwise, reject generic single words and return the longest remaining.
+    # Nothing matched? Drop the obviously generic bits and keep the longest.
     filtered = [s for s in segments if not _NAME_REJECT_WORDS.match(s)]
     if filtered:
         return max(filtered, key=len)
-    # As a last resort, return the original text unsplit.
+    # Last resort: just hand back what came in.
     return text or None
 
 
@@ -706,7 +723,7 @@ def probe_robots_txt(domain: str) -> tuple[bool, Optional[str]]:
 
 
 def probe_sitemap(domain: str, base_url: str) -> tuple[bool, Optional[str]]:
-    # Prefer a Sitemap: directive inside robots.txt
+    # First place I look is robots.txt — if there's a Sitemap: line, trust it.
     try:
         r = _http().get(f"https://{domain}/robots.txt", timeout=T_PROBE)
         if r.status_code == 200:
@@ -715,7 +732,7 @@ def probe_sitemap(domain: str, base_url: str) -> tuple[bool, Optional[str]]:
                     return True, line.split(":", 1)[1].strip()
     except Exception:
         pass
-    # Otherwise try conventional locations
+    # If that didn't work, just try the usual filenames.
     for path in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml"):
         candidate = drop_www(urljoin(base_url, path))
         try:
@@ -727,9 +744,7 @@ def probe_sitemap(domain: str, base_url: str) -> tuple[bool, Optional[str]]:
     return False, None
 
 
-# ==========================================================================
-# End-to-end crawl
-# ==========================================================================
+# ----- The full crawl, end to end -----
 def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     print(f"\n[crawl] {start_url}")
     final_url, bare_domain = resolve_url(start_url)
@@ -749,7 +764,7 @@ def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     soup = BeautifulSoup(homepage_html, "lxml")
     agent = ChurchIntelAgent()
 
-    # ---- deterministic fields ------------------------------------------
+    # First pass: stuff I can pull out without the LLM.
     social = collect_social_urls(soup, final_url)
     menu_labels, menu_urls = parse_navigation(soup, final_url)
 
@@ -765,13 +780,13 @@ def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     prayer_url = key_pages.get("prayer")
     giving_info = analyze_giving_info(giving_url)
 
-    # ---- LLM-assisted fields -------------------------------------------
+    # Second pass: the fuzzy stuff, where the LLM helps.
     header_text, footer_text = split_header_footer(soup)
     title_raw = soup.title.get_text(strip=True) if soup.title else None
-    # Structured signals for the church name, in priority order.
-    # <title> is the most reliable signal on almost every church site, so we
-    # try it first and only fall through to meta/h1 when it is missing or
-    # clearly unhelpful (blank, or a generic word like "Home").
+    # I look at multiple signals for the church name, in order of how much I
+    # trust them. <title> tends to be the most reliable on church sites, so
+    # I check that first and only fall through to og:title / h1 when title
+    # is missing or just says something useless like "Home".
     def _looks_like_name(s: str) -> bool:
         if not s or len(s) < 3:
             return False
@@ -811,7 +826,7 @@ def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     has_multi = agent.is_multisite(body_text)
     prayer_info = analyze_prayer_info(prayer_url, homepage_html, agent)
 
-    # ---- miscellaneous signals -----------------------------------------
+    # Third pass: a few extra signals worth recording.
     low_html = homepage_html.lower()
     has_events = "events" in key_pages or "calendar" in low_html
     has_sermons = "sermons" in key_pages or "watch" in low_html or "media" in low_html
@@ -819,7 +834,8 @@ def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     sitemap_ok, sitemap_url = probe_sitemap(bare_domain, final_url)
     mobile_app = inspect_mobile_app(soup, homepage_html, giving_info.get("provider_detected"))
 
-    # ---- confidence ----------------------------------------------------
+    # Rough confidence score — I bump it up for each thing I successfully
+    # found, so a record with no name and no key pages stays low.
     score = 0.5
     if llm_name:
         score += 0.15
@@ -832,7 +848,8 @@ def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     if prayer_info["has_prayer_page"] or giving_info["has_giving_page"]:
         score += 0.10
 
-    # ---- notes ---------------------------------------------------------
+    # Friendly notes I attach so a human reader can see at a glance what
+    # came out well and what didn't.
     notes: list[str] = []
     if not church_name:
         notes.append("Church name could not be determined")
@@ -893,11 +910,11 @@ def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     }
 
 
-# ==========================================================================
-# CSV loader
-# ==========================================================================
+# ----- CSV loader (for the demo runner) -----
 def load_domains_from_csv(csv_path: str, limit: int) -> list[str]:
-    """First column of every row is the domain (no header row)."""
+    """The boss's CSV doesn't have a header row, and the domain is in the
+    first column. So I just read column 0 of each row and stop once I've
+    collected enough."""
     rows: list[str] = []
     with open(csv_path, encoding="utf-8", errors="ignore", newline="") as f:
         for row in csv.reader(f):
@@ -911,9 +928,10 @@ def load_domains_from_csv(csv_path: str, limit: int) -> list[str]:
     return rows
 
 
-# ==========================================================================
-# Database persistence - map a crawl record onto the SQLAlchemy models
-# ==========================================================================
+# ----- Saving a crawl into the DB -----
+# Takes the nested dict crawl_site() returns and writes it across all the
+# child tables. Upserts on the original URL so re-crawling the same site
+# updates the existing row instead of duplicating it.
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -924,17 +942,18 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
 
 
 def persist_record(record: dict, db: Session) -> Church:
-    """Write one crawl record (the JSON dict returned by crawl_site) into
-    the database. If a church row for the same website already exists it
-    is updated in-place; otherwise a new row is created.
+    """Take one crawl record (the dict crawl_site spit out) and save it.
 
-    Returns the SQLAlchemy Church instance (already flushed, not committed -
-    the caller controls the transaction)."""
+    If I've already got a row for this website, I update it in place; if not,
+    I add a fresh one. I flush but don't commit — the caller decides when to
+    commit, which keeps batch flows simple.
+    """
 
     website_original = record.get("website_url_original") or ""
     final_domain = record.get("final_domain") or ""
 
-    # Upsert on the original URL (stable key from the source CSV)
+    # I upsert on the original URL because that's the stable key coming from
+    # the source CSV — it doesn't change between crawls.
     church = (
         db.query(Church)
           .filter(Church.website_url_original == website_original)
@@ -944,7 +963,7 @@ def persist_record(record: dict, db: Session) -> Church:
         church = Church(website_url_original=website_original)
         db.add(church)
 
-    # --- Core identity + crawl metadata ----------------------------------
+    # Top-level fields on the parent row.
     church.source_row_id        = record.get("source_row_id")
     church.church_name          = record.get("church_name")
     church.website_url_normalized = record.get("website_url_normalized")
@@ -960,10 +979,12 @@ def persist_record(record: dict, db: Session) -> Church:
     church.sitemap_url          = additional.get("sitemap_url")
     church.pages_sampled_count  = int(additional.get("pages_sampled_count") or 0)
 
-    # Flush so the church gets a PK before we attach children
+    # Flush first so SQLAlchemy hands me a real church.id; I need that as
+    # the foreign key on every child row I'm about to add.
     db.flush()
 
-    # --- Wipe stale child rows and re-create from the fresh record -------
+    # If this is an update (not an insert), wipe the old children before I
+    # re-add fresh ones. Simpler than diffing and avoids stale rows.
     for child_cls in (SocialLink, MainMenu, KeyPage, RawHTML, AdditionalInfo):
         db.query(child_cls).filter(child_cls.church_id == church.id).delete()
     db.query(MobileApp).filter(MobileApp.church_id == church.id).delete()
@@ -971,7 +992,7 @@ def persist_record(record: dict, db: Session) -> Church:
     db.query(GivingDetails).filter(GivingDetails.church_id == church.id).delete()
     db.flush()
 
-    # --- Social links ----------------------------------------------------
+    # Social links — one row per platform that has a URL.
     social = record.get("social") or {}
     for platform in ("instagram", "facebook", "youtube", "x",
                      "threads", "tiktok", "linkedin"):
@@ -981,7 +1002,7 @@ def persist_record(record: dict, db: Session) -> Church:
     for extra_url in (social.get("other_social_urls") or []):
         db.add(SocialLink(church_id=church.id, platform="other", url=extra_url))
 
-    # --- Mobile app (one-to-one) -----------------------------------------
+    # Mobile app — one row per church (or none).
     mobile = record.get("mobile_app") or {}
     if mobile:
         db.add(MobileApp(
@@ -991,7 +1012,7 @@ def persist_record(record: dict, db: Session) -> Church:
             app_name=None,
         ))
 
-    # --- Main menu items (preserving order) ------------------------------
+    # Main menu — keeping the original menu order via the position column.
     menu = record.get("main_menu") or {}
     items = menu.get("items") or []
     urls = menu.get("urls") or []
@@ -999,13 +1020,13 @@ def persist_record(record: dict, db: Session) -> Church:
         db.add(MainMenu(church_id=church.id, label=label,
                         url=url, position=position))
 
-    # --- Key pages -------------------------------------------------------
+    # Key pages — about, sermons, giving, prayer, and friends.
     for page_type, url in (record.get("key_pages") or {}).items():
         if url:
             db.add(KeyPage(church_id=church.id, page_type=page_type,
                            url=url, title=None))
 
-    # --- Prayer (one-to-one) ---------------------------------------------
+    # Prayer details — single row per church.
     prayer = record.get("prayer") or {}
     if prayer:
         db.add(PrayerDetails(
@@ -1015,7 +1036,7 @@ def persist_record(record: dict, db: Session) -> Church:
             details=json.dumps(prayer, ensure_ascii=False),
         ))
 
-    # --- Giving (one-to-one) ---------------------------------------------
+    # Giving details — single row per church too.
     giving = record.get("giving") or {}
     if giving:
         db.add(GivingDetails(
@@ -1025,7 +1046,8 @@ def persist_record(record: dict, db: Session) -> Church:
             details=json.dumps(giving, ensure_ascii=False),
         ))
 
-    # --- Additional info (flattened key/value pairs) ---------------------
+    # Everything else gets flattened into key/value rows here, so I don't
+    # have to keep adding columns every time the boss wants a new flag.
     for key, value in additional.items():
         db.add(AdditionalInfo(
             church_id=church.id,
@@ -1033,7 +1055,8 @@ def persist_record(record: dict, db: Session) -> Church:
             value="" if value is None else str(value),
         ))
 
-    # --- Raw HTML snapshot ----------------------------------------------
+    # I keep a trimmed snapshot of the homepage HTML so I can sanity-check
+    # later what the page actually looked like at crawl time.
     raw_html = record.get("raw_html_homepage")
     if raw_html:
         db.add(RawHTML(
@@ -1049,9 +1072,10 @@ def persist_record(record: dict, db: Session) -> Church:
 
 def crawl_and_persist(url: str, db: Session, source_row_id: str = "api",
                       enable_llm: bool = True) -> dict:
-    """Convenience wrapper: run a crawl, persist it, commit, and return the
-    JSON record. Used by the FastAPI endpoints."""
-    # Pre-warm the agent singleton with the requested LLM setting
+    """The thing FastAPI endpoints actually call. It crawls, saves, commits,
+    and hands back the JSON record — all in one go."""
+    # Pre-build the agent up front, so the LLM-on/off flag for this call is
+    # already locked in before crawl_site starts asking it questions.
     ChurchIntelAgent(enable_llm=enable_llm)
     record = crawl_site(url, source_row_id=source_row_id)
     persist_record(record, db)
@@ -1059,9 +1083,9 @@ def crawl_and_persist(url: str, db: Session, source_row_id: str = "api",
     return record
 
 
-# ==========================================================================
-# Demo runner - writes one JSON per church, then a summary table
-# ==========================================================================
+# ----- Demo runner -----
+# CLI entry point. For each domain in the CSV it crawls, drops the JSON to
+# disk, and at the end prints a tidy summary table I can show to the boss.
 def run_demo(csv_path: str, limit: int = 10, output_dir: str = "crawl_output",
              enable_llm: bool = True):
     out_path = Path(output_dir)
@@ -1069,7 +1093,8 @@ def run_demo(csv_path: str, limit: int = 10, output_dir: str = "crawl_output",
 
     domains = load_domains_from_csv(csv_path, limit=limit)
     print(f"=== Crawling {len(domains)} church sites ===")
-    # Pre-warm the agent so model-loading output is clearly delimited
+    # I load the model up front so its noisy "loading…" log isn't tangled
+    # in with the per-church crawl output below.
     ChurchIntelAgent(enable_llm=enable_llm)
 
     results: list[dict] = []
@@ -1101,7 +1126,7 @@ def run_demo(csv_path: str, limit: int = 10, output_dir: str = "crawl_output",
         results.append(record)
         time.sleep(1)
 
-    # ---- summary table ----
+    # End-of-run summary table.
     print("\n" + "=" * 78)
     print(f"{'#':>2}  {'DOMAIN':<30}  {'CHURCH NAME':<30}  STATUS")
     print("-" * 78)
@@ -1128,7 +1153,7 @@ if __name__ == "__main__":
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--out", default="crawl_output")
     p.add_argument("--no-llm", action="store_true",
-                   help="Skip the Qwen model and use rule-based extraction only")
+                   help="Skip Qwen entirely and just use the regex fallbacks.")
     args = p.parse_args()
     run_demo(args.csv, limit=args.limit, output_dir=args.out,
              enable_llm=not args.no_llm)
