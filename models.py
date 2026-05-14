@@ -139,3 +139,20 @@ class RawHTML(Base):
     fetched_at = Column(DateTime, nullable=True)
 
     church = relationship("Church", back_populates="raw_html_pages")
+
+class FailedURL(Base):
+    __tablename__ = "failed_urls"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    source_row_id = Column(String, nullable=True)
+    website_url_original = Column(String, nullable=False)
+    final_domain = Column(String, nullable=True)
+    failure_reason = Column(Text, nullable=True)
+    attempted_at = Column(DateTime, nullable=True)
+    retry_count = Column(Integer, default=0)
+    
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<FailedURLs(id={self.id}, url={self.website_url_original})>"

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from database import engine, Base, get_db
 from models import (
     Church, SocialLink, MobileApp, MainMenu,
-    KeyPage, PrayerDetails, GivingDetails, AdditionalInfo, RawHTML,
+    KeyPage, PrayerDetails, GivingDetails, AdditionalInfo, RawHTML, FailedURL,
 )
 from schemas import CrawlRequest, BatchCrawlRequest, ChurchSummary
 from services import crawl_and_persist
@@ -344,3 +344,39 @@ def get_church_html(church_id: int, db: Session = Depends(get_db)):
         }
         for p in pages
     ]
+
+@app.get("/failed-urls", tags=["Failed URLs"])
+def list_of_failed_urls(db: Session = Depends(get_db),
+                        limit: int=100, offset: int=0):
+    """Now listing URLs the crawler couldn't reach, starting with newest."""
+    rows = (
+        db.query(FailedURL)
+        .order_by(FailedURL.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return [
+        {
+            "id": f.id,
+            "url": f.website_url_original,
+            "domain": f.final_domain,
+            "reason": f.failure_reason,
+            "attempted_at": f.attempted_at.isoformat() if f.attempted_at else None,
+            "retry_count": f.retry_count
+        }
+        for f in rows
+    ]
+@app.get("/failed-urls/stats", tags=["Failed URLs"])      
+def failed_url_stats(db: Session = Depends(get_db)): 
+    """Now for every distinct error message, how many URLs hit it?"""       
+    from sqlalchemy import func 
+    rows = (
+        db.query(FailedURL.failure_reason, func.count(FailedURL.id))
+        .group_by(FailedURL.failure_reason)
+        .order_by(func.count(FailedURL.id).desc())
+        .all()      
+    )    
+    return {
+        "total": db.query(FailedURL).count(),
+        "by_reason": [{"reason": r, "count": n} for r, n in rows],
+    }

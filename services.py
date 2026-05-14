@@ -648,7 +648,7 @@ def analyze_giving_info(giving_url: Optional[str]) -> dict:
     }
 
 
-# ----- Small odds-and-ends -----
+# Small odds-and-ends
 TITLE_SEPARATORS = ("|", "-", "\u2013", "\u2014", "\u00bb", ":", "\u2022")
 
 # These words are a strong tell that a chunk of text is actually the name
@@ -744,7 +744,7 @@ def probe_sitemap(domain: str, base_url: str) -> tuple[bool, Optional[str]]:
     return False, None
 
 
-# ----- The full crawl, end to end -----
+# The full crawl now, end to end 
 def crawl_site(start_url: str, source_row_id: str = "auto") -> dict:
     print(f"\n[crawl] {start_url}")
     final_url, bare_domain = resolve_url(start_url)
@@ -951,6 +951,18 @@ def persist_record(record: dict, db: Session) -> Church:
 
     website_original = record.get("website_url_original") or ""
     final_domain = record.get("final_domain") or ""
+    if record.get("crawl_status") == "failed":
+        from models import FailedURL
+        db.add(FailedURL(
+            source_row_id=record.get("source_row_id"),
+            website_url_original=website_original,
+            final_domain=final_domain,
+            failure_reason=record.get("crawl_notes"),
+            attempted_at=_parse_timestamp(record.get("crawl_timestamp")),
+            retry_count=0
+        ))
+        db.flush()
+        return None 
 
     # I upsert on the original URL because that's the stable key coming from
     # the source CSV — it doesn't change between crawls.
